@@ -16,8 +16,8 @@ on:
         description: make -k (collect all compile errors in one run)
         default: "true"
       runner:
-        description: GitHub runner image (needs an Xcode 15.x; try macos-15 when macos-14 is unavailable)
-        default: macos-14
+        description: GitHub runner image (empty = both macos-14 and macos-15-intel)
+        default: ""
   push:
     branches: [main, herolte, codex/a5xelte-bringup]
     paths:
@@ -37,9 +37,15 @@ env:
 
 jobs:
   build:
-    # macos-14 still ships Xcode 15.x: its iig matches the xnu-8796 IORPC ABI
-    # (Xcode 16's iig emits IORPC.kernelContent, which this xnu lacks)
-    runs-on: ${{ inputs.runner || 'macos-14' }}
+    # A push builds on both macOS queues: the arm64 one (macos-14, Xcode 15)
+    # left jobs unacquired for hours in Oct 2026, the Intel one did not.
+    # Xcode 16's iig emits IORPC.kernelContent, which 0083 adds to this xnu.
+    # Each runner uploads its own artifacts (xnu-kernel-<runner>).
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJSON(inputs.runner && format('["{0}"]', inputs.runner) || '["macos-15","macos-15-intel"]') }}
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
@@ -59,7 +65,7 @@ jobs:
           from pathlib import Path
           path, config = Path(sys.argv[1]), sys.argv[2]
           old = 'ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"'
-          if config in ('A5XELTE', 'HEROLTE'):
+          if config in ('A5XELTE', 'HEROLTE', 'A51'):
               new = ('ARCHS="arm64" VALID_ARCHS="arm64" OTHER_CFLAGS="-mkernel -nostdinc '
                      '-Wno-packed -mcpu=cortex-a53 -march=armv8-a+crypto"')
           else:
@@ -80,7 +86,8 @@ jobs:
           sw_vers
           ls -d /Applications/Xcode*.app
           # Prefer an Xcode 15.x (iig ABI above); otherwise the oldest one.
-          XC=$(ls -d /Applications/Xcode_15*.app 2>/dev/null | sort -V | tail -1)
+          XC=$(ls -d /Applications/Xcode_16*.app 2>/dev/null | sort -V | tail -1)
+          [ -n "$XC" ] || XC=$(ls -d /Applications/Xcode_15*.app 2>/dev/null | sort -V | tail -1)
           [ -n "$XC" ] || XC=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)
           echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
           sudo xcode-select -s "$XC"
@@ -112,8 +119,14 @@ jobs:
           pat = re.compile(r'(error:|fatal error|Error \d|\*\*\* |FAILED|Skipping patch|No such file|panic|❌)', re.I)
           # Compiler/linker errors first: blacktop's known patch-skip lines
           # come first in the log and used to fill every annotation.
-          cc = re.compile(r'(:\d+:\d+: (fatal )?error:|^ld: |Undefined symbols|clang: error)')
+          # (Not "ld: warning": dtrace's libelf version warnings filled every
+          # annotation and hid the real error, run 47.)
+          cc = re.compile(r'(:\d+:\d+: (fatal )?error:|^ld: (?!warning)|Undefined symbols|clang: error|^make.*Error)')
           hits = [l for l in clean if cc.search(l)]
+          # The lines around each compiler error (annotations hold 4 KiB).
+          for i, l in enumerate(clean):
+              if re.search(r':\d+:\d+: (fatal )?error:', l) and len(hits) < 40:
+                  hits.append('CONTEXT ' + ' | '.join(x[:200] for x in clean[i:i + 4]))
           hits += [l for l in clean if pat.search(l) and l not in hits and 'Skipping patch' not in l
                    and 'already exists in working directory' not in l and 'patch does not apply' not in l]
           esc = lambda s: s.replace('%', '%25').replace('\r', '').replace('\n', '%0A')
@@ -142,7 +155,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: xnu-buildtree
+          name: xnu-buildtree-${{ matrix.runner }}
           path: buildtree.tgz
           retention-days: 7
 
@@ -169,12 +182,12 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: xnu-kernel
+          name: xnu-kernel-${{ matrix.runner }}
           path: out/
           if-no-files-found: warn
 
       - name: Check Cortex-A53 compatibility (no ARMv8.1 LSE atomics)
-        if: env.MACHINE_CONFIG == 'A5XELTE' || env.MACHINE_CONFIG == 'HEROLTE'
+        if: env.MACHINE_CONFIG == 'A5XELTE' || env.MACHINE_CONFIG == 'HEROLTE' || env.MACHINE_CONFIG == 'A51'
         run: |
           kernel="out/kernel.$(echo "$KERNEL_CONFIG" | tr A-Z a-z).$(echo "$MACHINE_CONFIG" | tr A-Z a-z)"
           test -f "$kernel"

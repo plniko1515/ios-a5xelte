@@ -33,7 +33,7 @@ index 0000000..2bbe492
 + * LUN 0. rd=ufsroot0 exposes the GPT partition ufsroot= (default
 + * "USERDATA") as ufsroot0; writes need ufsrw=1 and stay inside it.
 + */
-+#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++#if defined(ARM64_BOARD_CONFIG_HEROLTE) || defined(ARM64_BOARD_CONFIG_A51)
 +#include <sys/param.h>
 +#include <sys/systm.h>
 +#include <sys/buf.h>
@@ -822,7 +822,7 @@ index 6bf49ce..14b89f3 100644
  		a5xelte_emmc_probe();
  	}
  	}
-+#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++#if defined(ARM64_BOARD_CONFIG_HEROLTE) || defined(ARM64_BOARD_CONFIG_A51)
 +	{
 +	uint32_t ufsprobe = 0;
 +	PE_parse_boot_argn("ufsprobe", &ufsprobe, sizeof(ufsprobe));
