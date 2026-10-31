@@ -18,11 +18,13 @@ index 0000000..1111111
 +/*
 + * HEROLTE (Galaxy S7, Exynos 8890) WiFi: Broadcom BCM4359 on PCIe0.
 + *
-+ * Full driver stages (see WIFI-S7-HARDWARE.md):
-+ *   1. PCIe link training  <- this file implements
-+ *   2. BAR allocation + bus mastering
-+ *   3. BCM4359 firmware loading (bcmdhd FullMAC)
-+ *   4. 802.11 / IO80211Controller integration
++ * Full driver stages:
++ *   1. PCIe link training  ✅ (soft reset, LTSSM enable, linkup poll)
++ *   2. BAR allocation + bus mastering  ✅ (this version)
++ *   3. BCM4359 firmware loading (bcmdhd FullMAC)  — framework
++ *   4. bcmdhd FullMAC protocol (ioctls, events)  — framework
++ *   5. 802.11 / IO80211Controller integration  — TODO
++ *   6. Network interface (ifnet TX/RX)  — TODO
 + *
 + * Hardware (stock S7 DTB, exynos8890-pcie @ 0x15660000):
 + *   elbi    = 0x15660000  (application registers)
@@ -30,18 +32,16 @@ index 0000000..1111111
 + *   sysreg  = 0x15601044  (system register)
 + *   dbi     = 0x157a0000  (DBI / config space base)
 + *   pcs     = 0x156f0000  (PCS)
-+ *   config  = 0x1c000000  (PCIe config space)
++ *   config  = 0x1c000000  (PCIe config space, 0x10000)
 + *   IRQ = 0xcc, MSI base = 0xc8, 1 lane.
 + *
-+ * Register offsets derived from the Samsung Linux driver (pci-exynos.c
-+ * + pci-exynos8890.c + pci-exynos8890_cal.c).
-+ *
-+ * Enable with boot arg wifiprobe=1. Prints link status and device ID.
++ * Enable with boot arg wifiprobe=1.
 + */
 +#if defined(ARM64_BOARD_CONFIG_HEROLTE)
 +#include <sys/param.h>
 +#include <sys/systm.h>
 +#include <sys/errno.h>
++#include <sys/malloc.h>
 +#include <machine/machine_routines.h>
 +#include <pexpert/pexpert.h>
 +
@@ -49,15 +49,14 @@ index 0000000..1111111
 +
 +/* Register offsets (from pci-exynos8890.c) */
 +#define PCIE_SOFT_CORE_RESET        0x000
-+#define PCIE_ELBI_LTSSM_ENABLE      0x004  /* LTSSM enable (write 0x1) */
-+#define PCIE_APP_LTSSM_ENABLE       0x004
-+#define PCIE_ELBI_RDLH_LINKUP       0x008  /* linkup status: bits [4:0] */
++#define PCIE_ELBI_LTSSM_ENABLE      0x004
++#define PCIE_ELBI_RDLH_LINKUP       0x008
 +#define PCIE_APP_REQ_EXIT_L1_MODE   0x010
 +#define PCIE_QCH_SEL                0x014
 +#define PCIE_L1_BUG_FIX_ENABLE      0x018
 +#define PCIE_LINKDOWN_RST_CTRL_SEL  0x01c
 +#define PCIE_PM_DSTATE              0x020
-+#define PCIE_APP_REQ_EXIT_L1_MODE_BIT 0
++
 +#define APP_REQ_EXIT_L1_MODE        (1 << 0)
 +#define L1_REQ_NAK_CONTROL_MASTER   (1 << 1)
 +#define PCIE_LINKDOWN_RST_MANUAL    0x1
@@ -66,6 +65,8 @@ index 0000000..1111111
 +#define PCIE_ELBI_LTSSM_DISABLE     0x0
 +#define PCIE_ELBI_LTSSM_ENABLE_VAL  0x1
 +
++#define MAX_TIMEOUT     1000
++
 +#define PCIE0_ELBI_PA   0x15660000u
 +#define PCIE0_PHY_PA    0x15630000u
 +#define PCIE0_SYSREG_PA 0x15601044u
@@ -73,9 +74,31 @@ index 0000000..1111111
 +#define PCIE0_PCS_PA    0x156f0000u
 +#define PCIE0_CFG_PA    0x1c000000u
 +#define PCIE0_IRQ       0xcc
-+#define MAX_TIMEOUT     1000
++
++/* PCI config space offsets */
++#define PCI_VENDOR_ID       0x00
++#define PCI_DEVICE_ID       0x02
++#define PCI_COMMAND         0x04
++#define PCI_STATUS          0x06
++#define PCI_BAR0            0x10
++#define PCI_BAR1            0x14
++#define PCI_SUBSYS_VENDOR   0x2c
++#define PCI_SUBSYS_ID       0x2e
++#define PCI_ROM_ADDRESS     0x30
++#define PCI_INTERRUPT_LINE  0x3c
++#define PCI_INTERRUPT_PIN   0x3d
++
++#define PCI_CMD_IO          (1 << 0)
++#define PCI_CMD_MEM         (1 << 1)
++#define PCI_CMD_MASTER      (1 << 2)
++#define PCI_CMD_SERR        (1 << 8)
++
++#define BCM4359_VENDOR_ID   0x14e4
++#define BCM4359_DEVICE_ID   0x43ec
 +
 +static vm_offset_t pcie_elbi, pcie_dbi, pcie_cfg, pcie_pcs;
++static vm_offset_t bcm_bar0_va;
++static uint32_t bcm_bar0_pa, bcm_bar0_size;
 +
 +static uint32_t
 +pcie_rd(vm_offset_t base, uint32_t off)
@@ -96,7 +119,6 @@ index 0000000..1111111
 +static void
 +udelay_approx(uint32_t us)
 +{
-+	/* Busy-wait using the architected timer (26 MHz). */
 +	uint64_t t0, freq = 26000000;
 +	__asm__ volatile ("mrs %0, cntfrq_el0" : "=r" (freq));
 +	if (!freq) freq = 26000000;
@@ -106,6 +128,161 @@ index 0000000..1111111
 +	do {
 +		__asm__ volatile ("isb; mrs %0, cntpct_el0" : "=r" (now));
 +	} while (now < target);
++}
++
++/* Stage 1: PCIe link training */
++static int
++pcie_link_train(void)
++{
++	/* Step 1: avoid checking rx elecidle when accessing DBI */
++	if (pcie_pcs)
++		pcie_wr(pcie_pcs, 0xEC, pcie_rd(pcie_pcs, 0xEC) | (1 << 3));
++
++	/* Step 2: soft core reset */
++	pcie_wr(pcie_elbi, PCIE_SOFT_CORE_RESET, 0x0);
++	udelay_approx(20);
++	pcie_wr(pcie_elbi, PCIE_SOFT_CORE_RESET, 0x1);
++
++	/* Step 3: APP_REQ_EXIT_L1_MODE + L1 NAK control */
++	uint32_t val = pcie_rd(pcie_elbi, PCIE_APP_REQ_EXIT_L1_MODE);
++	val |= APP_REQ_EXIT_L1_MODE;
++	val |= L1_REQ_NAK_CONTROL_MASTER;
++	pcie_wr(pcie_elbi, PCIE_APP_REQ_EXIT_L1_MODE, val);
++	pcie_wr(pcie_elbi, PCIE_LINKDOWN_RST_CTRL_SEL, PCIE_LINKDOWN_RST_MANUAL);
++
++	/* Q-Channel: disable clock gating */
++	val = pcie_rd(pcie_elbi, PCIE_QCH_SEL);
++	val &= ~CLOCK_GATING_MASK;
++	val |= CLOCK_NOT_GATING;
++	pcie_wr(pcie_elbi, PCIE_QCH_SEL, val);
++
++	/* Step 4: L1 bug fix */
++	pcie_wr(pcie_elbi, PCIE_L1_BUG_FIX_ENABLE, 0x1);
++
++	/* Step 5: assert LTSSM enable */
++	pcie_wr(pcie_elbi, PCIE_APP_LTSSM_ENABLE, PCIE_ELBI_LTSSM_ENABLE_VAL);
++
++	/* Step 6: poll linkup */
++	int count = 0;
++	uint32_t linkup;
++	do {
++		linkup = pcie_rd(pcie_elbi, PCIE_ELBI_RDLH_LINKUP) & 0x1f;
++		if (linkup >= 0x0d && linkup <= 0x14)
++			break;
++		count++;
++		udelay_approx(10);
++	} while (count < MAX_TIMEOUT);
++
++	if (count >= MAX_TIMEOUT) {
++		printf("herolte_wifi: link NOT up (LTSSM=0x%02x)\n", linkup);
++		return -1;
++	}
++	printf("herolte_wifi: link UP (LTSSM=0x%02x) after %d tries\n", linkup, count);
++
++	/* Restore phy_pcs rx elecidle check */
++	if (pcie_pcs)
++		pcie_wr(pcie_pcs, 0xEC, pcie_rd(pcie_pcs, 0xEC) & ~(1 << 3));
++
++	return 0;
++}
++
++/* Stage 2: BAR allocation + bus mastering */
++static int
++pcie_device_setup(void)
++{
++	/* Read vendor/device ID */
++	uint32_t id = *(volatile uint32_t *)(pcie_cfg + PCI_VENDOR_ID);
++	uint16_t vendor = id & 0xffff;
++	uint16_t device = (id >> 16) & 0xffff;
++	printf("herolte_wifi: vendor=0x%04x device=0x%04x\n", vendor, device);
++
++	if (vendor != BCM4359_VENDOR_ID) {
++		printf("herolte_wifi: unexpected vendor (expected 0x%04x)\n", BCM4359_VENDOR_ID);
++	}
++
++	/* Read BAR0 */
++	uint32_t bar0 = *(volatile uint32_t *)(pcie_cfg + PCI_BAR0);
++	printf("herolte_wifi: BAR0 raw = 0x%08x\n", bar0);
++
++	if (bar0 & 0x1) {
++		printf("herolte_wifi: BAR0 is I/O space (not supported)\n");
++		return -1;
++	}
++
++	/* BAR0 size detection: write 0xffffffff, read back, restore */
++	uint32_t bar0_orig = bar0;
++	*(volatile uint32_t *)(pcie_cfg + PCI_BAR0) = 0xffffffff;
++	__asm__ volatile ("dsb osh" ::: "memory");
++	uint32_t bar0_size_raw = *(volatile uint32_t *)(pcie_cfg + PCI_BAR0);
++	*(volatile uint32_t *)(pcie_cfg + PCI_BAR0) = bar0_orig;
++	__asm__ volatile ("dsb osh" ::: "memory");
++
++	if (bar0_size_raw == 0) {
++		printf("herolte_wifi: BAR0 size detection failed\n");
++		return -1;
++	}
++
++	bcm_bar0_size = ~(bar0_size_raw & 0xfffffff0) + 1;
++	bcm_bar0_pa = bar0 & 0xfffffff0;
++	printf("herolte_wifi: BAR0 pa=0x%08x size=0x%08x\n", bcm_bar0_pa, bcm_bar0_size);
++
++	/* Enable bus mastering + memory space + IO space */
++	uint32_t cmd = *(volatile uint32_t *)(pcie_cfg + PCI_COMMAND);
++	cmd |= PCI_CMD_IO | PCI_CMD_MEM | PCI_CMD_MASTER;
++	*(volatile uint32_t *)(pcie_cfg + PCI_COMMAND) = cmd;
++	__asm__ volatile ("dsb osh" ::: "memory");
++	printf("herolte_wifi: PCI command = 0x%08x (bus master enabled)\n", cmd);
++
++	/* Map BAR0 */
++	if (bcm_bar0_pa && bcm_bar0_size) {
++		bcm_bar0_va = ml_io_map(bcm_bar0_pa, bcm_bar0_size);
++		if (!bcm_bar0_va) {
++			printf("herolte_wifi: ml_io_map for BAR0 failed\n");
++			return -1;
++		}
++		printf("herolte_wifi: BAR0 mapped at va=%p\n", (void*)bcm_bar0_va);
++	}
++
++	/* Set interrupt line */
++	*(volatile uint8_t *)(pcie_cfg + PCI_INTERRUPT_LINE) = PCIE0_IRQ & 0xff;
++	__asm__ volatile ("dsb osh" ::: "memory");
++
++	return 0;
++}
++
++/* Stage 3: firmware loading framework */
++static int
++bcm4359_load_firmware(void)
++{
++	/* TODO: Load bcmdhd firmware + NVRAM from /vendor/firmware/.
++	 * On XNU, firmware would be embedded in the kernel or loaded via
++	 * a firmware request mechanism. The bcmdhd protocol requires:
++	 * 1. Download firmware image to device RAM via PCIe BAR
++	 * 2. Download NVRAM (board-specific config) 
++	 * 3. Trigger firmware initialization
++	 * 4. Wait for firmware ready signal
++	 *
++	 * Without the actual firmware files, this is a no-op skeleton.
++	 */
++	printf("herolte_wifi: firmware loading not yet implemented\n");
++	printf("herolte_wifi: need bcmdhd firmware + NVRAM for BCM4359\n");
++	return -1;
++}
++
++/* Stage 4: bcmdhd FullMAC protocol (ioctls) */
++static int
++bcm4359_init_fullmac(void)
++{
++	/* TODO: bcmdhd FullMAC protocol:
++	 * 1. Send DL (download) command to firmware
++	 * 2. Query device info (MAC address, capabilities)
++	 * 3. Configure interface (mode, channel, etc.)
++	 * 4. Register event handlers (scan results, connection, etc.)
++	 *
++	 * This requires the bcmdhd protocol implementation (~10k lines).
++	 */
++	printf("herolte_wifi: FullMAC init not yet implemented\n");
++	return -1;
 +}
 +
 +int herolte_wifi_init(void)
@@ -128,65 +305,25 @@ index 0000000..1111111
 +	printf("herolte_wifi: PCIe0 mapped (elbi=%p dbi=%p cfg=%p pcs=%p)\n",
 +	       (void*)pcie_elbi, (void*)pcie_dbi, (void*)pcie_cfg, (void*)pcie_pcs);
 +
-+	/* Step 1: avoid checking rx elecidle when accessing DBI */
-+	if (pcie_pcs)
-+		pcie_wr(pcie_pcs, 0xEC, pcie_rd(pcie_pcs, 0xEC) | (1 << 3));
-+
-+	/* Step 2: soft core reset (low then high) */
-+	pcie_wr(pcie_elbi, PCIE_SOFT_CORE_RESET, 0x0);
-+	udelay_approx(20);
-+	pcie_wr(pcie_elbi, PCIE_SOFT_CORE_RESET, 0x1);
-+
-+	/* Step 3: APP_REQ_EXIT_L1_MODE + L1 NAK control */
-+	uint32_t val = pcie_rd(pcie_elbi, PCIE_APP_REQ_EXIT_L1_MODE);
-+	val |= APP_REQ_EXIT_L1_MODE;
-+	val |= L1_REQ_NAK_CONTROL_MASTER;
-+	pcie_wr(pcie_elbi, PCIE_APP_REQ_EXIT_L1_MODE, val);
-+	pcie_wr(pcie_elbi, PCIE_LINKDOWN_RST_CTRL_SEL, PCIE_LINKDOWN_RST_MANUAL);
-+
-+	/* Q-Channel support: disable clock gating */
-+	val = pcie_rd(pcie_elbi, PCIE_QCH_SEL);
-+	val &= ~CLOCK_GATING_MASK;
-+	val |= CLOCK_NOT_GATING;
-+	pcie_wr(pcie_elbi, PCIE_QCH_SEL, val);
-+
-+	/* Step 4: L1 bug fix enable */
-+	pcie_wr(pcie_elbi, PCIE_L1_BUG_FIX_ENABLE, 0x1);
-+
-+	/* Step 5: assert LTSSM enable */
-+	pcie_wr(pcie_elbi, PCIE_APP_LTSSM_ENABLE, PCIE_ELBI_LTSSM_ENABLE_VAL);
-+
-+	/* Step 6: poll linkup (LTSSM state 0x0d..0x14 = link up) */
-+	int count = 0;
-+	uint32_t linkup;
-+	do {
-+		linkup = pcie_rd(pcie_elbi, PCIE_ELBI_RDLH_LINKUP) & 0x1f;
-+		if (linkup >= 0x0d && linkup <= 0x14)
-+			break;
-+		count++;
-+		udelay_approx(10);
-+	} while (count < MAX_TIMEOUT);
-+
-+	if (count >= MAX_TIMEOUT) {
-+		printf("herolte_wifi: link NOT up (LTSSM=0x%02x) after %d tries\n", linkup, count);
-+	} else {
-+		printf("herolte_wifi: link UP (LTSSM=0x%02x) after %d tries\n", linkup, count);
++	/* Stage 1: link training */
++	if (pcie_link_train() != 0) {
++		printf("herolte_wifi: PCIe link training failed\n");
++		return -1;
 +	}
 +
-+	/* Step 7: read PCIe config space (vendor/device ID at offset 0) */
-+	uint32_t id = *(volatile uint32_t *)(pcie_cfg + 0x00);
-+	printf("herolte_wifi: config space [0x00] = 0x%08x (expect 0x43ec14e4 for BCM4359)\n", id);
++	/* Stage 2: device setup */
++	if (pcie_device_setup() != 0) {
++		printf("herolte_wifi: device setup failed\n");
++		return -1;
++	}
 +
-+	/* Read BAR0 from config space offset 0x10 */
-+	uint32_t bar0 = *(volatile uint32_t *)(pcie_cfg + 0x10);
-+	printf("herolte_wifi: BAR0 = 0x%08x\n", bar0);
++	/* Stage 3: firmware loading (will fail until firmware is available) */
++	bcm4359_load_firmware();
 +
-+	/* Restore phy_pcs rx elecidle check */
-+	if (pcie_pcs)
-+		pcie_wr(pcie_pcs, 0xEC, pcie_rd(pcie_pcs, 0xEC) & ~(1 << 3));
++	/* Stage 4: FullMAC init (will fail until firmware is loaded) */
++	bcm4359_init_fullmac();
 +
-+	/* TODO: BAR allocation, bus mastering enable, BCM4359 firmware load,
-+	 * bcmdhd FullMAC init, IO80211Controller registration. */
++	printf("herolte_wifi: init complete (stages 1-2 done, 3-4 pending)\n");
 +
 +	return 0;
 +}
