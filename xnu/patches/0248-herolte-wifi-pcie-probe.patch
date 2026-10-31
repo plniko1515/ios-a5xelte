@@ -1,0 +1,99 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 0000000..1111111 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -106,6 +106,7 @@ bsd/dev/random/randomdev.c			standard
+ bsd/dev/memdev.c			standard
+ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/a5xelte_emmc.c			standard
++bsd/dev/herolte_wifi.c			standard
+ bsd/dev/a5xelte_keys.c			standard
+ bsd/dev/a5xelte_touch.c			standard
+ bsd/dev/sweet_sample.c			standard
+diff --git a/bsd/dev/herolte_wifi.c b/bsd/dev/herolte_wifi.c
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/bsd/dev/herolte_wifi.c
++/*
++ * HEROLTE (Galaxy S7, Exynos 8890) WiFi: Broadcom BCM4359 on PCIe0.
++ *
++ * Hardware (from the stock S7 DTB, exynos8890-pcie @ 0x15660000):
++ *   PCIe0 controller (enabled in DTB):
++ *     elbi  = 0x15660000  (ELBI / application registers)
++ *     phy   = 0x15630000  (PHY registers)
++ *     sysreg= 0x15601044  (system register / PMU)
++ *     dbi   = 0x157a0000  (DBI / configuration space base)
++ *     pcs   = 0x156f0000  (PCS)
++ *     config= 0x1c000000  (PCIe config space, 0x10000)
++ *   IRQ = 0xcc (204), MSI base 0xc8, 1 lane.
++ *   Clocks: gate_pciewifi0, wifi0_dig_refclk, pcie_wifi0_tx0, pcie_wifi0_rx0.
++ *
++ *   The 'wlan' node (compatible "samsung,brcm-wlan") wraps the PCIe device.
++ *   The BCM4359 firmware is loaded by the bcmdhd FullMAC driver in Linux.
++ *
++ * This file is a FIRST STEP: it maps the PCIe controller and reads the
++ * vendor/device ID from config space. It does NOT yet implement 802.11.
++ * Full WiFi requires: PCIe link training, BCM4359 firmware loading (bcmdhd
++ * FullMAC protocol), and integration with Apple's IO80211Controller.
++ *
++ * Build: guarded by ARM64_BOARD_CONFIG_HEROLTE. Enable with boot arg
++ * wifiprobe=1 (prints PCIe config space vendor/device ID to the console).
++ */
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++#define PCIE0_ELBI_PA   0x15660000u
++#define PCIE0_PHY_PA    0x15630000u
++#define PCIE0_SYSREG_PA 0x15601044u
++#define PCIE0_DBI_PA    0x157a0000u
++#define PCIE0_PCS_PA    0x156f0000u
++#define PCIE0_CFG_PA    0x1c000000u
++#define PCIE0_IRQ       0xcc
++
++static vm_offset_t pcie_elbi, pcie_dbi, pcie_cfg;
++
++int herolte_wifi_init(void)
++{
++	uint32_t probe = 0;
++	PE_parse_boot_argn("wifiprobe", &probe, sizeof(probe));
++	if (probe != 1)
++		return 0;
++
++	pcie_elbi = ml_io_map(PCIE0_ELBI_PA, 0x1000);
++	pcie_dbi  = ml_io_map(PCIE0_DBI_PA, 0x1000);
++	pcie_cfg  = ml_io_map(PCIE0_CFG_PA, 0x10000);
++
++	if (!pcie_elbi || !pcie_dbi || !pcie_cfg) {
++		printf("herolte_wifi: ml_io_map failed\n");
++		return ENOMEM;
++	}
++
++	/* Read vendor/device ID from PCIe config space offset 0x00. */
++	uint32_t id = *(volatile uint32_t *)(pcie_cfg + 0x00);
++	printf("herolte_wifi: PCIe0 vendor/device = 0x%08x (expect 0x14e4/0x43ec for BCM4359)\n", id);
++
++	/* Read link status from DBI offset 0x80 (PCIe link control/status). */
++	uint32_t link = *(volatile uint32_t *)(pcie_dbi + 0x80);
++	printf("herolte_wifi: PCIe link status = 0x%08x\n", link);
++
++	/* TODO: PCIe link training, BCM4359 firmware load, bcmdhd FullMAC init,
++	 * IO80211Controller registration. See WIFI-S7-HARDWARE.md. */
++
++	return 0;
++}
++
++/* Called from IOKitBSDInit or a work loop. Stub for now. */
++int herolte_wifi_probe(void)
++{
++	return herolte_wifi_init();
++}
++#endif /* ARM64_BOARD_CONFIG_HEROLTE */
++EOF
++echo "written"
