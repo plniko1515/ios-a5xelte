@@ -97,3 +97,19 @@ index 0000000..1111111
 +#endif /* ARM64_BOARD_CONFIG_HEROLTE */
 +EOF
 +echo "written"
+
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index 6bf49ce..a51patch 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -776,6 +776,11 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ 	a5xelte_keys_init();
+ 	a5xelte_touch_probe();
+ #endif
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++	extern "C" int herolte_wifi_probe(void);
++	herolte_wifi_probe();
++#endif
+ 	{
+ 	uint32_t emmcprobe = 0;
+ 	PE_parse_boot_argn("emmcprobe", &emmcprobe, sizeof(emmcprobe));
