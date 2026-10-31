@@ -31,12 +31,20 @@ Extracted from the stock S7 (SM-G930F, XEO) boot.img DTB (G930FXXU8EVG3).
 - Samsung uses bcmdhd (FullMAC) driver in the stock kernel
 
 ## Driver implementation stages
-1. **PCIe link training** (current skeleton: herolte_wifi.c) — map controller, read vendor/device ID from config space.
-2. **PCIe device enumeration** — find BCM4359 (vendor 0x14e4, device 0x43ec), enable bus mastering, allocate BARs.
-3. **Firmware loading** — load bcmdhd firmware + NVRAM into device RAM.
-4. **bcmdhd FullMAC protocol** — control messages (ioctls) to the firmware, event handling.
-5. **802.11 integration** — implement IO80211Controller/IO80211Interface subclasses, WPA supplicant glue.
-6. **Network interface** — ifnet registration, packet TX/RX.
+1. **PCIe link training** ✅ (herolte_wifi.c) — soft reset, LTSSM enable, linkup poll (from Linux exynos8890-pcie driver). Reads vendor/device ID and BAR0 from config space.
+2. **PCIe device enumeration** — find BCM4359 (vendor 0x14e4, device 0x43ec), enable bus mastering, allocate BARs. TODO.
+3. **Firmware loading** — load bcmdhd firmware + NVRAM into device RAM. TODO.
+4. **bcmdhd FullMAC protocol** — control messages (ioctls) to the firmware, event handling. TODO.
+5. **802.11 integration** — implement IO80211Controller/IO80211Interface subclasses, WPA supplicant glue. TODO.
+6. **Network interface** — ifnet registration, packet TX/RX. TODO.
+
+## GPU acceleration (Mali-T880 MP12)
+Current state (herolte):
+- Mali-T880 working for frame presentation (Panfrost, 3.3 ms/frame scaling).
+- HeroGPU IOKit service (patch 0239) exposes GEM/submit to userspace.
+- Mesa 25 Panfrost for iOS (workflow `mesa-ios`) — OpenGL ES from iOS apps (in progress).
+- Full Metal/CoreAnimation acceleration requires Metal shim (Chlorophyll) on top of Mesa — ongoing upstream work.
+- "Better GPU acceleration" = completing the Mesa/Panfrost integration so iOS rendering uses the GPU instead of CPU.
 
 ## GPU acceleration (Mali-T880, already working for presentation)
 - Current: Mali-T880 MP12 used for scaling iOS frames to panel (3.3 ms/frame, Panfrost).
